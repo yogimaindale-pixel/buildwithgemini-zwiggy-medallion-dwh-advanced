@@ -1,4 +1,8 @@
-"""Reconciliation Suite (RC-1 through RC-10)."""
+"""Reconciliation Suite (RC-1 through RC-10).
+
+Executes end-to-end data reconciliation checks comparing metrics across Bronze,
+Silver, and Gold layers to verify completeness, grain integrity, and consistency.
+"""
 
 from dataclasses import dataclass
 import logging
@@ -12,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReconCheck:
-    """Result of a reconciliation check."""
+    """Dataclass representing the verdict of a reconciliation check."""
     check_id: str
     check_name: str
     expected_value: Optional[float]
@@ -116,6 +120,62 @@ def run_rc3(conn, batch: Batch) -> ReconCheck:
         variance=variance,
         verdict=verdict,
         details=f"Silver orders {slv_cnt} vs Fact orders {fact_cnt}."
+    )
+
+
+def run_rc4(conn, batch: Batch) -> ReconCheck:
+    """RC-4: Total order amount consistency between Silver and Fact layers."""
+    slv_sum = fetch_scalar(
+        conn,
+        "SELECT COALESCE(SUM(total_amount), 0) FROM silver.slv_order WHERE dw_batch_id = %s",
+        (batch.batch_id,)
+    ) or 0.0
+
+    fact_sum = fetch_scalar(
+        conn,
+        "SELECT COALESCE(SUM(total_amount), 0) FROM gold.fact_order WHERE dw_batch_id = %s",
+        (batch.batch_id,)
+    ) or 0.0
+
+    variance = abs(float(slv_sum) - float(fact_sum))
+    verdict = "PASS" if variance <= 0.01 else "FAIL"
+
+    return ReconCheck(
+        check_id="RC-4",
+        check_name="Silver to Fact Order Financial Amount Consistency",
+        expected_value=float(slv_sum),
+        actual_value=float(fact_sum),
+        variance=variance,
+        verdict=verdict,
+        details=f"Silver total amount ${slv_sum:,.2f} vs Fact total amount ${fact_sum:,.2f}."
+    )
+
+
+def run_rc5(conn, batch: Batch) -> ReconCheck:
+    """RC-5: Total payment amount vs Total order amount check."""
+    order_sum = fetch_scalar(
+        conn,
+        "SELECT COALESCE(SUM(total_amount), 0) FROM gold.fact_order WHERE dw_batch_id = %s",
+        (batch.batch_id,)
+    ) or 0.0
+
+    payment_sum = fetch_scalar(
+        conn,
+        "SELECT COALESCE(SUM(amount), 0) FROM gold.fact_payment WHERE dw_batch_id = %s AND status = 'COMPLETED'",
+        (batch.batch_id,)
+    ) or 0.0
+
+    variance = abs(float(order_sum) - float(payment_sum))
+    verdict = "PASS" if float(order_sum) == 0.0 or variance / max(float(order_sum), 1.0) <= 0.10 else "WARN"
+
+    return ReconCheck(
+        check_id="RC-5",
+        check_name="Order Financial Reconciliation against Completed Payments",
+        expected_value=float(order_sum),
+        actual_value=float(payment_sum),
+        variance=variance,
+        verdict=verdict,
+        details=f"Total orders ${order_sum:,.2f} vs Completed payments ${payment_sum:,.2f}."
     )
 
 
@@ -264,7 +324,8 @@ def record_recon(conn, batch: Batch, check: ReconCheck) -> None:
 def run_reconciliation(batch: Batch) -> List[ReconCheck]:
     """Execute complete reconciliation suite (RC-1 through RC-10)."""
     checks = [
-        run_rc1, run_rc2, run_rc3, run_rc6, run_rc7, run_rc8, run_rc9, run_rc10
+        run_rc1, run_rc2, run_rc3, run_rc4, run_rc5,
+        run_rc6, run_rc7, run_rc8, run_rc9, run_rc10
     ]
 
     results = []

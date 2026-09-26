@@ -1,122 +1,150 @@
-"""Database connectivity and connection management for Zwiggy Medallion Data Warehouse."""
+"""Database connectivity, context management, and query helpers.
+
+Implements guarded read-only access to source database, warehouse connection contexts,
+exponential backoff retries for transient errors, and robust query execution helper functions.
+"""
 
 from contextlib import contextmanager
+import functools
 import logging
 import time
-from typing import Any, Callable, Generator, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
+
 import psycopg2
-from psycopg2 import errors
-from psycopg2.extras import RealDictCursor
+import psycopg2.extras
+from psycopg2 import OperationalError, InterfaceError, DatabaseError
 
 from zwiggy_dwh.config import DbTarget, settings
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+F = TypeVar('F', bound=Callable[..., Any])
+
+
+class DatabaseConnectionError(Exception):
+    """Raised when database connection fails or times out."""
+    pass
 
 
 def connect(target: DbTarget) -> psycopg2.extensions.connection:
-    """Establish connection to PostgreSQL using target parameters."""
-    return psycopg2.connect(
-        host=target.host,
-        port=target.port,
-        dbname=target.dbname,
-        user=target.user,
-        password=target.password
-    )
+    """Establish PostgreSQL connection to target database."""
+    try:
+        conn = psycopg2.connect(
+            host=target.host,
+            port=target.port,
+            dbname=target.dbname,
+            user=target.user,
+            password=target.password,
+            connect_timeout=10
+        )
+        return conn
+    except Exception as e:
+        logger.error("Failed to connect to database %s: %s", target.masked_repr(), e)
+        raise DatabaseConnectionError(f"Database connection error: {e}") from e
+
+
+def check_connection(target: Optional[DbTarget] = None) -> bool:
+    """Test connectivity to target database (defaults to warehouse target)."""
+    t = target or settings().warehouse_target
+    try:
+        with connect(t) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("Database health check failed for %s: %s", t.masked_repr(), e)
+        return False
 
 
 def with_retry(
-    func: Callable[..., T],
     max_retries: Optional[int] = None,
-    backoff: Optional[float] = None
-) -> T:
-    """Execute function with exponential backoff for transient DB errors."""
-    s = settings()
-    retries = max_retries if max_retries is not None else s.max_retries
-    delay = backoff if backoff is not None else s.retry_backoff_seconds
-
-    transient_errors = (
-        psycopg2.OperationalError,
-        errors.DeadlockDetected,
-        errors.LockNotAvailable,
-        errors.SerializationFailure,
-    )
-
-    attempt = 0
-    while True:
-        try:
-            return func()
-        except transient_errors as e:
-            attempt += 1
-            if attempt > retries:
-                logger.error("Max retries (%d) exceeded. Last error: %s", retries, e)
-                raise
-            sleep_time = delay * (2 ** (attempt - 1))
-            logger.warning("Transient DB error (%s). Retrying in %.2fs (attempt %d/%d)...", e, sleep_time, attempt, retries)
-            time.sleep(sleep_time)
+    backoff_seconds: Optional[float] = None
+) -> Callable[[F], F]:
+    """Decorator to retry DB operations on transient operational errors."""
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            s = settings()
+            retries = max_retries if max_retries is not None else s.max_retries
+            delay = backoff_seconds if backoff_seconds is not None else s.retry_backoff_seconds
+            
+            last_err = None
+            for attempt in range(1, retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (OperationalError, InterfaceError) as e:
+                    last_err = e
+                    if attempt == retries:
+                        logger.error("Operation failed after %d retries: %s", retries, e)
+                        raise
+                    logger.warning("DB transient error on attempt %d/%d (%s). Retrying in %.1fs...", attempt, retries, e, delay)
+                    time.sleep(delay)
+                    delay *= 2.0
+            raise last_err  # type: ignore
+        return wrapper  # type: ignore
+    return decorator
 
 
 @contextmanager
-def source_connection() -> Generator[psycopg2.extensions.connection, None, None]:
-    """Context manager for source database (read-only guarded connection)."""
+def source_connection():
+    """Context manager providing guarded read-only connection to source OLTP database."""
     s = settings()
     conn = connect(s.source_target)
     try:
         with conn.cursor() as cur:
-            cur.execute("SET default_transaction_read_only = on;")
-            if s.statement_timeout_ms > 0:
-                cur.execute("SET statement_timeout = %s;", (s.statement_timeout_ms,))
-        conn.commit()
+            cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
+            cur.execute(f"SET statement_timeout = {s.statement_timeout_ms};")
         yield conn
     finally:
         conn.close()
 
 
 @contextmanager
-def warehouse_connection(autocommit: bool = False) -> Generator[psycopg2.extensions.connection, None, None]:
-    """Context manager for warehouse database (read/write connection)."""
+def warehouse_connection():
+    """Context manager providing transactional read-write connection to Warehouse database."""
     s = settings()
     conn = connect(s.warehouse_target)
-    if autocommit:
-        conn.autocommit = True
     try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {s.statement_timeout_ms};")
         yield conn
-        if not autocommit:
-            conn.commit()
+        conn.commit()
     except Exception:
-        if not autocommit:
-            conn.rollback()
+        conn.rollback()
         raise
     finally:
         conn.close()
 
 
-def execute_sql(conn: psycopg2.extensions.connection, query: str, params: Optional[Tuple[Any, ...]] = None) -> int:
-    """Execute SQL statement and return rowcount."""
+@with_retry()
+def execute_sql(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> int:
+    """Execute SQL DDL or DML statement and return affected row count."""
     with conn.cursor() as cur:
-        cur.execute(query, params)
+        cur.execute(sql, params)
         return cur.rowcount
 
 
-def fetch_all(conn: psycopg2.extensions.connection, query: str, params: Optional[Tuple[Any, ...]] = None) -> List[dict]:
-    """Execute SQL query and return all rows as dictionaries."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, params)
+@with_retry()
+def fetch_all(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> List[Dict[str, Any]]:
+    """Execute SQL query and return results as list of dictionary rows."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
 
 
-def fetch_one(conn: psycopg2.extensions.connection, query: str, params: Optional[Tuple[Any, ...]] = None) -> Optional[dict]:
-    """Execute SQL query and return single row as dictionary."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, params)
+@with_retry()
+def fetch_one(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+    """Execute SQL query and return first row as dictionary or None."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
         row = cur.fetchone()
         return dict(row) if row else None
 
 
-def fetch_scalar(conn: psycopg2.extensions.connection, query: str, params: Optional[Tuple[Any, ...]] = None) -> Any:
-    """Execute SQL query and return first column of first row."""
+@with_retry()
+def fetch_scalar(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> Any:
+    """Execute SQL query and return single scalar value or None."""
     with conn.cursor() as cur:
-        cur.execute(query, params)
+        cur.execute(sql, params)
         row = cur.fetchone()
         return row[0] if row else None
