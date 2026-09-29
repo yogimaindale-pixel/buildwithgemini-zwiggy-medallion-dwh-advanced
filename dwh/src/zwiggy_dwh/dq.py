@@ -1,4 +1,21 @@
-"""Data Quality Rule Engine."""
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - DATA QUALITY (DQ) ENGINE (dq.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module evaluates data quality rules configured in `silver.dq_rule` against
+warehouse tables and logs pass/fail verdicts into `ctl.ctl_dq_result`.
+
+Why is this module critical for Junior Developers?
+1. Data Governance & Thresholds: Compares calculated failure rates against configured limits
+   (e.g., threshold = 0.01 for 1% max allowed nulls).
+2. Severity Actions ('BLOCK' vs 'WARN'): 'BLOCK' severity rules halt batch execution if violated,
+   protecting downstream reporting dashboards from corrupt data.
+3. Automated Audit Logging: Every evaluation attempt records total rows evaluated, failing row count,
+   failure rate percentage, and diagnostic details.
+===============================================================================
+"""
 
 from dataclasses import dataclass
 import logging
@@ -10,9 +27,14 @@ from zwiggy_dwh.db import execute_sql, fetch_all, fetch_one, fetch_scalar, wareh
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# DQ RULE EVALUATION RESULT CONTAINER
+# -----------------------------------------------------------------------------
 @dataclass
 class DqResult:
-    """Evaluation result for a single DQ rule."""
+    """
+    Data object storing evaluation outputs for a single Data Quality rule execution.
+    """
     rule_id: str
     target_object: str
     rows_evaluated: int
@@ -24,8 +46,13 @@ class DqResult:
     details: str
 
 
+# -----------------------------------------------------------------------------
+# RULE EVALUATOR FUNCTION
+# -----------------------------------------------------------------------------
 def evaluate_rule(conn, batch: Batch, rule: dict) -> DqResult:
-    """Evaluate a single active DQ rule against target table/view in warehouse."""
+    """
+    Evaluates a single active Data Quality rule SQL expression against a target table in the warehouse.
+    """
     rule_id = rule["rule_id"]
     layer = rule["layer"]
     target_object = rule["target_object"]
@@ -36,7 +63,7 @@ def evaluate_rule(conn, batch: Batch, rule: dict) -> DqResult:
     full_table = f"{layer}.{target_object}"
 
     try:
-        # Check if table exists
+        # 1. Verify target table existence
         exists = fetch_scalar(
             conn,
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s)",
@@ -55,7 +82,7 @@ def evaluate_rule(conn, batch: Batch, rule: dict) -> DqResult:
                 details=f"Target object {full_table} does not exist yet; skipped."
             )
 
-        # Count total rows
+        # 2. Count total rows in target table
         total_rows = fetch_scalar(conn, f"SELECT COUNT(*) FROM {full_table}") or 0
 
         if total_rows == 0:
@@ -71,10 +98,11 @@ def evaluate_rule(conn, batch: Batch, rule: dict) -> DqResult:
                 details="Target table empty; 0 rows evaluated."
             )
 
-        # Count failing rows (TRUE = pass expression, FALSE/NULL = fail expression)
+        # 3. Count rows violating the SQL validation expression
         failed_rows = fetch_scalar(conn, f"SELECT COUNT(*) FROM {full_table} WHERE NOT ({expr}) OR ({expr}) IS NULL") or 0
         failure_rate = float(failed_rows) / float(total_rows) if total_rows > 0 else 0.0
 
+        # 4. Determine verdict based on threshold comparison
         verdict = "PASS" if failure_rate <= threshold else "FAIL"
         details = f"Evaluated {total_rows} rows; {failed_rows} failed (failure rate {failure_rate:.4f}, threshold {threshold:.4f})."
 
@@ -105,8 +133,11 @@ def evaluate_rule(conn, batch: Batch, rule: dict) -> DqResult:
         )
 
 
+# -----------------------------------------------------------------------------
+# AUDIT LOG INSERTION HELPER
+# -----------------------------------------------------------------------------
 def record_result(conn, batch: Batch, res: DqResult) -> None:
-    """Record DQ rule evaluation result into ctl_dq_result."""
+    """Inserts DQ rule evaluation output record into `ctl.ctl_dq_result`."""
     execute_sql(
         conn,
         """
@@ -124,8 +155,13 @@ def record_result(conn, batch: Batch, res: DqResult) -> None:
     )
 
 
+# -----------------------------------------------------------------------------
+# MASTER DQ RULE RUNNER
+# -----------------------------------------------------------------------------
 def run_rules(batch: Batch) -> List[DqResult]:
-    """Execute all active data quality rules for batch."""
+    """
+    Fetches and evaluates all active Data Quality rules defined in `silver.dq_rule`.
+    """
     results = []
 
     with warehouse_connection() as conn:
@@ -137,7 +173,6 @@ def run_rules(batch: Batch) -> List[DqResult]:
                 record_result(conn, batch, res)
                 results.append(res)
 
-    # Log summary
     failures = [r for r in results if r.verdict == "FAIL"]
     blocks = [r for r in failures if r.severity == "BLOCK"]
     logger.info("DQ Rule Evaluation completed: %d rules evaluated, %d failed (%d BLOCK severity)", len(results), len(failures), len(blocks))

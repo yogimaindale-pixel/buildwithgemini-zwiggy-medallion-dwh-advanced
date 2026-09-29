@@ -1,7 +1,19 @@
-"""Reconciliation Suite (RC-1 through RC-10).
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - RECONCILIATION SUITE MODULE (reconcile.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module executes end-to-end data reconciliation checks (RC-1 through RC-10)
+cross-verifying row counts, financial sum metrics, grain uniqueness, and SCD2 date range
+integrity across Bronze, Silver, and Gold layers.
 
-Executes end-to-end data reconciliation checks comparing metrics across Bronze,
-Silver, and Gold layers to verify completeness, grain integrity, and consistency.
+Why is this module critical for Junior Developers?
+1. Data Lineage & Accounting Integrity: Verifies that `Extracted Rows == Bronze Landed Rows == (Silver Loaded + Quarantined Rows)`.
+2. Financial Precision: Ensures that total order revenue in Silver matches Gold Fact tables (`$0.00` variance allowed).
+3. Foreign Key Resolution Auditing (RC-6): Checks the percentage of facts referencing `-1` (Unknown Surrogate Key) to prevent orphan records.
+4. SCD2 Overlap Detection (RC-8): Guarantees that valid date ranges (`valid_from` to `valid_to`) do not overlap for the same dimension entity.
+===============================================================================
 """
 
 from dataclasses import dataclass
@@ -14,20 +26,28 @@ from zwiggy_dwh.db import execute_sql, fetch_scalar, warehouse_connection
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# RECONCILIATION RESULT CONTAINER
+# -----------------------------------------------------------------------------
 @dataclass
 class ReconCheck:
-    """Dataclass representing the verdict of a reconciliation check."""
+    """
+    Data object storing output verdict for a single reconciliation check.
+    """
     check_id: str
     check_name: str
     expected_value: Optional[float]
     actual_value: Optional[float]
     variance: Optional[float]
-    verdict: str  # PASS, FAIL, SKIP
+    verdict: str  # 'PASS', 'FAIL', 'WARN', or 'SKIP'
     details: str
 
 
+# -----------------------------------------------------------------------------
+# RC-1: EXTRACT TO BRONZE ROW COUNT RECONCILIATION
+# -----------------------------------------------------------------------------
 def run_rc1(conn, batch: Batch) -> ReconCheck:
-    """RC-1: Extract row count equals Bronze landed row count."""
+    """RC-1: Verifies that extracted rows in manifest equal landed rows in Bronze."""
     extracted = fetch_scalar(
         conn,
         "SELECT COALESCE(SUM(extracted_rows), 0) FROM ctl.ctl_extract_manifest WHERE dw_batch_id = %s",
@@ -60,8 +80,11 @@ def run_rc1(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-2: BRONZE TO SILVER ACCOUNTING CHECK
+# -----------------------------------------------------------------------------
 def run_rc2(conn, batch: Batch) -> ReconCheck:
-    """RC-2: Bronze rows accounted for in Silver (loaded + quarantined >= bronze)."""
+    """RC-2: Ensures (Silver Loaded + Quarantined) >= Bronze landed rows."""
     bronze_cnt = fetch_scalar(
         conn,
         "SELECT COUNT(*) FROM bronze.br_customer WHERE dw_batch_id = %s",
@@ -95,8 +118,11 @@ def run_rc2(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-3: SILVER ORDER TO FACT ORDER GRAIN CHECK
+# -----------------------------------------------------------------------------
 def run_rc3(conn, batch: Batch) -> ReconCheck:
-    """RC-3: Silver order count equals Fact order count for current batch."""
+    """RC-3: Verifies 1:1 order grain between Silver and Gold Fact Order tables."""
     slv_cnt = fetch_scalar(
         conn,
         "SELECT COUNT(*) FROM silver.slv_order WHERE dw_batch_id = %s",
@@ -123,8 +149,11 @@ def run_rc3(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-4: FINANCIAL AMOUNT CONSISTENCY
+# -----------------------------------------------------------------------------
 def run_rc4(conn, batch: Batch) -> ReconCheck:
-    """RC-4: Total order amount consistency between Silver and Fact layers."""
+    """RC-4: Verifies financial dollar sum consistency between Silver and Gold Fact Order tables."""
     slv_sum = fetch_scalar(
         conn,
         "SELECT COALESCE(SUM(total_amount), 0) FROM silver.slv_order WHERE dw_batch_id = %s",
@@ -151,8 +180,11 @@ def run_rc4(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-5: ORDER VS COMPLETED PAYMENT RECONCILIATION
+# -----------------------------------------------------------------------------
 def run_rc5(conn, batch: Batch) -> ReconCheck:
-    """RC-5: Total payment amount vs Total order amount check."""
+    """RC-5: Cross-checks total order amount against total completed payment amount."""
     order_sum = fetch_scalar(
         conn,
         "SELECT COALESCE(SUM(total_amount), 0) FROM gold.fact_order WHERE dw_batch_id = %s",
@@ -179,8 +211,11 @@ def run_rc5(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-6: FACT UNKNOWN SURROGATE KEY RESOLUTION RATE
+# -----------------------------------------------------------------------------
 def run_rc6(conn, batch: Batch) -> ReconCheck:
-    """RC-6: Fact foreign key resolution threshold (unknown customer_sk=-1 share <= 5%)."""
+    """RC-6: Ensures facts referencing customer_sk = -1 do not exceed 5% threshold."""
     total_facts = fetch_scalar(
         conn,
         "SELECT COUNT(*) FROM gold.fact_order WHERE dw_batch_id = %s",
@@ -218,8 +253,11 @@ def run_rc6(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-7: FACT ORDER UNIQUENESS
+# -----------------------------------------------------------------------------
 def run_rc7(conn, batch: Batch) -> ReconCheck:
-    """RC-7: Fact order uniqueness at order_id grain."""
+    """RC-7: Confirms zero duplicate order_ids exist in fact_order for the batch."""
     dup_cnt = fetch_scalar(
         conn,
         """
@@ -243,8 +281,11 @@ def run_rc7(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-8: SCD2 DATE RANGE INTEGRITY
+# -----------------------------------------------------------------------------
 def run_rc8(conn, batch: Batch) -> ReconCheck:
-    """RC-8: SCD2 non-overlapping date range integrity."""
+    """RC-8: Confirms no overlapping valid date ranges exist for dim_customer records."""
     overlap_cnt = fetch_scalar(
         conn,
         """
@@ -268,8 +309,11 @@ def run_rc8(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-9: MART TO FACT AGGREGATE RECONCILIATION
+# -----------------------------------------------------------------------------
 def run_rc9(conn, batch: Batch) -> ReconCheck:
-    """RC-9: Mart daily summary order count matches fact order count."""
+    """RC-9: Verifies sum of orders in reporting mart matches total count in fact_order."""
     fact_total = fetch_scalar(conn, "SELECT COUNT(*) FROM gold.fact_order") or 0
     mart_total = fetch_scalar(conn, "SELECT COALESCE(SUM(total_orders), 0) FROM gold.mart_daily_business_summary") or 0
 
@@ -287,8 +331,11 @@ def run_rc9(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RC-10: GOLD DATA FRESHNESS CHECK
+# -----------------------------------------------------------------------------
 def run_rc10(conn, batch: Batch) -> ReconCheck:
-    """RC-10: Gold freshness timestamp check."""
+    """RC-10: Verifies that Gold fact tables contain recent timestamps."""
     max_gold_ts = fetch_scalar(conn, "SELECT MAX(dw_ingest_ts_utc) FROM gold.fact_order")
 
     verdict = "PASS" if max_gold_ts is not None else "WARN"
@@ -304,8 +351,11 @@ def run_rc10(conn, batch: Batch) -> ReconCheck:
     )
 
 
+# -----------------------------------------------------------------------------
+# RECORD RECONCILIATION VERDICT HELPER
+# -----------------------------------------------------------------------------
 def record_recon(conn, batch: Batch, check: ReconCheck) -> None:
-    """Record reconciliation result into ctl_reconciliation."""
+    """Inserts reconciliation audit verdict into `ctl.ctl_reconciliation`."""
     execute_sql(
         conn,
         """
@@ -321,8 +371,13 @@ def record_recon(conn, batch: Batch, check: ReconCheck) -> None:
     )
 
 
+# -----------------------------------------------------------------------------
+# MASTER RECONCILIATION SUITE RUNNER
+# -----------------------------------------------------------------------------
 def run_reconciliation(batch: Batch) -> List[ReconCheck]:
-    """Execute complete reconciliation suite (RC-1 through RC-10)."""
+    """
+    Executes the full suite of 10 reconciliation checks (RC-1 through RC-10).
+    """
     checks = [
         run_rc1, run_rc2, run_rc3, run_rc4, run_rc5,
         run_rc6, run_rc7, run_rc8, run_rc9, run_rc10

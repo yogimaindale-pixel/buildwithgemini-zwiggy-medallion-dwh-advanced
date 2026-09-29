@@ -1,7 +1,20 @@
-"""Silver Layer Transformation and Conforming Engine.
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - SILVER TRANSFORMATIONS ENGINE (silver.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module transforms untyped raw string payloads in the Bronze layer into
+cleansed, strongly-typed, conformed, and PII-masked entity tables in the Silver layer (`silver.*`).
 
-Cleanses, types, conforms, and masks raw Bronze payloads into 17 Silver entity tables,
-routing malformed or missing key records to corresponding quarantine tables.
+Why is this module critical for Junior Developers?
+1. Data Cleansing & Type Casting: Converts string text into integers (`bigint`),
+   decimals (`numeric(12,2)`), timestamps (`timestamptz`), and booleans.
+2. PII Protection: Calls `silver.mask_pii()` to hash or mask sensitive user emails and phone numbers.
+3. Data Quality Quarantine: Malformed records missing primary keys (e.g. `customer_id IS NULL`)
+   are intercepted and routed into dedicated quarantine tables (`slv_customer_quarantine`).
+4. Upsert (SCD Type 1): Uses `ON CONFLICT (id) DO UPDATE SET` to merge updates seamlessly.
+===============================================================================
 """
 
 import logging
@@ -13,14 +26,23 @@ from zwiggy_dwh.db import execute_sql, fetch_scalar, warehouse_connection
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# SILVER CUSTOMER TRANSFORMATION (WITH PII MASKING & QUARANTINE)
+# -----------------------------------------------------------------------------
 def load_slv_customer(batch: Batch) -> Dict[str, int]:
-    """Transform br_customer into slv_customer with PII masking."""
+    """
+    Transforms raw `bronze.br_customer` into `silver.slv_customer`.
+    - Routes invalid records (missing customer_id) to `silver.slv_customer_quarantine`.
+    - Applies `silver.mask_pii()` to email and phone columns.
+    """
     sql = """
+    -- 1. Quarantine malformed records lacking primary keys
     INSERT INTO silver.slv_customer_quarantine (dw_batch_id, dw_quarantine_reason, dw_raw_payload)
     SELECT dw_batch_id, 'Missing customer_id', row_to_json(b)::jsonb
     FROM bronze.br_customer b
     WHERE dw_batch_id = %s AND (customer_id IS NULL OR customer_id = '');
 
+    -- 2. Cleanse, type-cast, and upsert valid records into Silver
     INSERT INTO silver.slv_customer (customer_id, name, email_masked, phone_masked, created_at, updated_at, dw_batch_id)
     SELECT
         customer_id::bigint,
@@ -46,8 +68,11 @@ def load_slv_customer(batch: Batch) -> Dict[str, int]:
         return {"written": w, "quarantined": q}
 
 
+# -----------------------------------------------------------------------------
+# SILVER ADDRESS TRANSFORMATION
+# -----------------------------------------------------------------------------
 def load_slv_address(batch: Batch) -> Dict[str, int]:
-    """Transform br_customer_address into slv_address."""
+    """Transforms raw `bronze.br_customer_address` into `silver.slv_address`."""
     sql = """
     INSERT INTO silver.slv_address (address_id, customer_id, address_line, city, state, postal_code, is_default, created_at, updated_at, dw_batch_id)
     SELECT
@@ -78,8 +103,11 @@ def load_slv_address(batch: Batch) -> Dict[str, int]:
         return {"written": w, "quarantined": 0}
 
 
+# -----------------------------------------------------------------------------
+# SILVER RESTAURANT TRANSFORMATION
+# -----------------------------------------------------------------------------
 def load_slv_restaurant(batch: Batch) -> Dict[str, int]:
-    """Transform br_restaurant into slv_restaurant."""
+    """Transforms raw `bronze.br_restaurant` into `silver.slv_restaurant`."""
     sql = """
     INSERT INTO silver.slv_restaurant (restaurant_id, name, cuisine, city, is_active, created_at, updated_at, dw_batch_id)
     SELECT
@@ -107,8 +135,15 @@ def load_slv_restaurant(batch: Batch) -> Dict[str, int]:
         return {"written": w, "quarantined": 0}
 
 
+# -----------------------------------------------------------------------------
+# SILVER ORDER TRANSFORMATION (WITH COHORT RULES & QUARANTINE)
+# -----------------------------------------------------------------------------
 def load_slv_order(batch: Batch) -> Dict[str, int]:
-    """Transform br_order_header into slv_order with cohort rules."""
+    """
+    Transforms raw `bronze.br_order_header` into `silver.slv_order`.
+    - Enforces order status uppercase standardization.
+    - Applies cohort derivation rules (e.g. order_id <= 50000 -> COHORT_A).
+    """
     sql = """
     INSERT INTO silver.slv_order_quarantine (dw_batch_id, dw_quarantine_reason, dw_raw_payload)
     SELECT dw_batch_id, 'Missing order_id', row_to_json(b)::jsonb
@@ -148,8 +183,14 @@ def load_slv_order(batch: Batch) -> Dict[str, int]:
         return {"written": w, "quarantined": q}
 
 
+# -----------------------------------------------------------------------------
+# SILVER PAYMENT TRANSFORMATION (WITH REFERENCE MAP LOOKUP)
+# -----------------------------------------------------------------------------
 def load_slv_payment(batch: Batch) -> Dict[str, int]:
-    """Transform br_order_payment into slv_payment using ref_payment_method_map."""
+    """
+    Transforms raw `bronze.br_order_payment` into `silver.slv_payment`.
+    Conforms raw payment method codes (e.g., 'cc', 'upi') using reference map `silver.ref_payment_method_map`.
+    """
     sql = """
     INSERT INTO silver.slv_payment (payment_id, order_id, payment_method, status, amount, created_at, updated_at, dw_batch_id)
     SELECT
@@ -177,8 +218,13 @@ def load_slv_payment(batch: Batch) -> Dict[str, int]:
         return {"written": w, "quarantined": 0}
 
 
+# -----------------------------------------------------------------------------
+# MASTER SILVER TRANSFORMATION RUNNER
+# -----------------------------------------------------------------------------
 def run_silver(batch: Batch) -> Dict[str, Dict[str, int]]:
-    """Execute Silver layer transformations for all entities in strict dependency order."""
+    """
+    Executes Silver transformations across all entities in strict dependency order.
+    """
     loaders = [
         ("slv_customer", load_slv_customer),
         ("slv_address", load_slv_address),

@@ -1,4 +1,22 @@
-"""Warehouse initialization script."""
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - WAREHOUSE INITIALIZATION MODULE (init_db.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module initializes the Medallion Data Warehouse schemas (ctl, bronze, silver, gold),
+creates all control tables, entity tables, dimension tables, fact tables, semantic views,
+and populates the static `dim_date` and `dim_time` calendar lookup dimensions.
+
+Why is this module critical for Junior Developers?
+1. Execution Sequence: SQL scripts must run in strict dependency order (e.g., schemas first,
+   reference lookup tables second, entity tables third, and fact tables last).
+2. Idempotence: Using `ON CONFLICT DO NOTHING` and `IF NOT EXISTS` ensures this script can
+   be safely re-run multiple times without throwing errors or duplicating static data.
+3. Date & Time Dimension Seeding: Pre-populates calendar lookup keys (e.g., 20260929 for Date SK)
+   to accelerate star-schema query aggregations in Gold layer.
+===============================================================================
+"""
 
 from datetime import date, timedelta
 import logging
@@ -10,8 +28,16 @@ from zwiggy_dwh.db import execute_sql, fetch_scalar, warehouse_connection
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# SQL FILE EXECUTION HELPER
+# -----------------------------------------------------------------------------
 def run_sql_file(file_path: Path) -> None:
-    """Read and execute a SQL file against warehouse database."""
+    """
+    Reads a .sql file from disk and executes its DDL/DML script against the Warehouse.
+    
+    Parameters:
+        file_path (Path): Path to the target SQL script file.
+    """
     logger.info("Executing SQL file: %s", file_path.name)
     with open(file_path, "r", encoding="utf-8") as f:
         sql = f.read()
@@ -19,8 +45,14 @@ def run_sql_file(file_path: Path) -> None:
         execute_sql(conn, sql)
 
 
+# -----------------------------------------------------------------------------
+# CALENDAR DIMENSION SEEDING FUNCTIONS
+# -----------------------------------------------------------------------------
 def seed_dim_date() -> None:
-    """Populate dim_date dimension for 2020 through 2030 if empty."""
+    """
+    Populates `gold.dim_date` calendar table for years 2020 through 2030 if empty.
+    Computes date_sk (YYYYMMDD integer key), year, quarter, month, day_of_week, and weekend flags.
+    """
     with warehouse_connection() as conn:
         count = fetch_scalar(conn, "SELECT COUNT(*) FROM gold.dim_date WHERE date_sk <> -1")
         if count and count > 0:
@@ -38,7 +70,7 @@ def seed_dim_date() -> None:
             quarter = (curr.month - 1) // 3 + 1
             month = curr.month
             day_of_month = curr.day
-            day_of_week = curr.isoweekday() # 1=Mon, 7=Sun
+            day_of_week = curr.isoweekday()  # 1=Monday, 7=Sunday
             is_weekend = day_of_week in (6, 7)
 
             execute_sql(
@@ -54,7 +86,9 @@ def seed_dim_date() -> None:
 
 
 def seed_dim_time() -> None:
-    """Populate dim_time dimension for all 1440 minutes of day if empty."""
+    """
+    Populates `gold.dim_time` dimension for all 1440 minute timestamps of a day (HHMM format).
+    """
     with warehouse_connection() as conn:
         count = fetch_scalar(conn, "SELECT COUNT(*) FROM gold.dim_time WHERE time_sk <> -1")
         if count and count > 0:
@@ -76,8 +110,13 @@ def seed_dim_time() -> None:
                 )
 
 
+# -----------------------------------------------------------------------------
+# MASTER INITIALIZATION SEQUENCER
+# -----------------------------------------------------------------------------
 def init_warehouse() -> None:
-    """Run full warehouse initialization sequence."""
+    """
+    Runs the complete multi-file SQL DDL sequence to construct the Data Warehouse.
+    """
     s = settings()
     sql_base = s.sql_dir
 

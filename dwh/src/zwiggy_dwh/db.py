@@ -1,7 +1,21 @@
-"""Database connectivity, context management, and query helpers.
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - DATABASE HELPER MODULE (db.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module provides database connection management, transactional context
+handlers, query retry mechanisms, and helper functions for executing SQL queries
+against PostgreSQL database targets safely.
 
-Implements guarded read-only access to source database, warehouse connection contexts,
-exponential backoff retries for transient errors, and robust query execution helper functions.
+Why is this module critical for Junior Developers?
+1. Resource Cleanup (`@contextmanager`): Automatically opens and closes database
+   connections using `with` blocks to prevent database connection leaks.
+2. Resilience (`@with_retry`): Decorates DB query execution to handle transient
+   network blips with exponential backoff retries.
+3. Read-Only Guardrails (`source_connection`): Enforces `READ ONLY` mode on source
+   OLTP transactions to protect operational databases from accidental writes.
+===============================================================================
 """
 
 from contextlib import contextmanager
@@ -18,16 +32,34 @@ from zwiggy_dwh.config import DbTarget, settings
 
 logger = logging.getLogger(__name__)
 
+# Type variable for generic function decoration
 F = TypeVar('F', bound=Callable[..., Any])
 
 
+# -----------------------------------------------------------------------------
+# CUSTOM DATABASE CONNECTION EXCEPTION
+# -----------------------------------------------------------------------------
 class DatabaseConnectionError(Exception):
-    """Raised when database connection fails or times out."""
+    """Raised when a database connection attempt fails or exceeds timeout limits."""
     pass
 
 
+# -----------------------------------------------------------------------------
+# CONNECTION FACTORY
+# -----------------------------------------------------------------------------
 def connect(target: DbTarget) -> psycopg2.extensions.connection:
-    """Establish PostgreSQL connection to target database."""
+    """
+    Establishes an active psycopg2 connection to the specified database target.
+    
+    Parameters:
+        target (DbTarget): Container with host, port, dbname, user, and password.
+        
+    Returns:
+        psycopg2.extensions.connection: Established PostgreSQL database connection.
+        
+    Raises:
+        DatabaseConnectionError: If connection cannot be established within 10s.
+    """
     try:
         conn = psycopg2.connect(
             host=target.host,
@@ -44,7 +76,15 @@ def connect(target: DbTarget) -> psycopg2.extensions.connection:
 
 
 def check_connection(target: Optional[DbTarget] = None) -> bool:
-    """Test connectivity to target database (defaults to warehouse target)."""
+    """
+    Executes a simple 'SELECT 1;' query to test database connectivity health.
+    
+    Parameters:
+        target (Optional[DbTarget]): Target database credentials (defaults to warehouse).
+        
+    Returns:
+        bool: True if database is reachable and responsive, False otherwise.
+    """
     t = target or settings().warehouse_target
     try:
         with connect(t) as conn:
@@ -56,11 +96,21 @@ def check_connection(target: Optional[DbTarget] = None) -> bool:
         return False
 
 
+# -----------------------------------------------------------------------------
+# EXPONENTIAL BACKOFF RETRY DECORATOR
+# -----------------------------------------------------------------------------
 def with_retry(
     max_retries: Optional[int] = None,
     backoff_seconds: Optional[float] = None
 ) -> Callable[[F], F]:
-    """Decorator to retry DB operations on transient operational errors."""
+    """
+    Higher-order decorator function that retries database operations when encountering
+    transient operational or interface network errors.
+    
+    Parameters:
+        max_retries (Optional[int]): Maximum number of retry attempts.
+        backoff_seconds (Optional[float]): Base delay in seconds before doubling wait time.
+    """
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -85,13 +135,20 @@ def with_retry(
     return decorator
 
 
+# -----------------------------------------------------------------------------
+# CONTEXT MANAGERS FOR SOURCE & WAREHOUSE CONNECTIONS
+# -----------------------------------------------------------------------------
 @contextmanager
 def source_connection():
-    """Context manager providing guarded read-only connection to source OLTP database."""
+    """
+    Context manager providing a guarded, READ-ONLY connection to the source OLTP database.
+    Guarantees that statement timeouts are applied and connection is closed safely.
+    """
     s = settings()
     conn = connect(s.source_target)
     try:
         with conn.cursor() as cur:
+            # Enforce read-only transaction guardrail to protect source system
             cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
             cur.execute(f"SET statement_timeout = {s.statement_timeout_ms};")
         yield conn
@@ -101,24 +158,40 @@ def source_connection():
 
 @contextmanager
 def warehouse_connection():
-    """Context manager providing transactional read-write connection to Warehouse database."""
+    """
+    Context manager providing a transactional READ-WRITE connection to the Data Warehouse.
+    Automatically commits transaction on success, or rolls back changes if an exception occurs.
+    """
     s = settings()
     conn = connect(s.warehouse_target)
     try:
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {s.statement_timeout_ms};")
         yield conn
-        conn.commit()
+        conn.commit()  # Auto-commit on clean completion
     except Exception:
-        conn.rollback()
+        conn.rollback()  # Rollback on any failure to preserve consistency
         raise
     finally:
         conn.close()
 
 
+# -----------------------------------------------------------------------------
+# SQL EXECUTION & QUERY HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
 @with_retry()
 def execute_sql(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> int:
-    """Execute SQL DDL or DML statement and return affected row count."""
+    """
+    Executes an DDL or DML statement (CREATE, INSERT, UPDATE, DELETE).
+    
+    Parameters:
+        conn: Active psycopg2 database connection.
+        sql (str): SQL statement to execute.
+        params (Optional[tuple]): SQL parameters for safe query binding.
+        
+    Returns:
+        int: Number of rows affected by statement.
+    """
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.rowcount
@@ -126,7 +199,9 @@ def execute_sql(conn: psycopg2.extensions.connection, sql: str, params: Optional
 
 @with_retry()
 def fetch_all(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> List[Dict[str, Any]]:
-    """Execute SQL query and return results as list of dictionary rows."""
+    """
+    Executes a SELECT query and returns all matching rows as a list of Python dictionaries.
+    """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
@@ -134,7 +209,9 @@ def fetch_all(conn: psycopg2.extensions.connection, sql: str, params: Optional[t
 
 @with_retry()
 def fetch_one(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
-    """Execute SQL query and return first row as dictionary or None."""
+    """
+    Executes a SELECT query and returns the single first matching row as a dictionary (or None).
+    """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
         row = cur.fetchone()
@@ -143,7 +220,9 @@ def fetch_one(conn: psycopg2.extensions.connection, sql: str, params: Optional[t
 
 @with_retry()
 def fetch_scalar(conn: psycopg2.extensions.connection, sql: str, params: Optional[tuple] = None) -> Any:
-    """Execute SQL query and return single scalar value or None."""
+    """
+    Executes a query and returns a single scalar value (e.g., COUNT(*), MAX(id)).
+    """
     with conn.cursor() as cur:
         cur.execute(sql, params)
         row = cur.fetchone()

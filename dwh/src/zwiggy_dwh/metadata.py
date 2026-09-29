@@ -1,4 +1,21 @@
-"""Source schema introspection, contract verification, and schema drift detection."""
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - METADATA & SCHEMA DRIFT ENGINE (metadata.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module provides schema introspection, data contract verification, and schema drift
+detection against the operational source PostgreSQL database (`public.*`).
+
+Why is this module critical for Junior Developers?
+1. Information Schema Introspection: Queries PostgreSQL's `information_schema.columns`
+   to dynamically inspect column names, ordinal positions, and data types.
+2. Data Contract Verification: Confirms that all expected source tables exist before
+   starting batch extraction pipelines.
+3. Schema Drift Detection: Identifies newly added or missing columns in source tables
+   so data engineers can adapt pipelines proactively.
+===============================================================================
+"""
 
 import logging
 from typing import Dict, List
@@ -8,8 +25,19 @@ from zwiggy_dwh.db import fetch_all, source_connection
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# SOURCE COLUMN INTROSPECTION
+# -----------------------------------------------------------------------------
 def get_source_columns(source_table: str) -> List[Dict[str, str]]:
-    """Query information_schema for source table column definitions."""
+    """
+    Queries `information_schema.columns` in the source database to fetch column details.
+    
+    Parameters:
+        source_table (str): Table name in public schema (e.g., 'customer').
+        
+    Returns:
+        List[Dict[str, str]]: Column metadata dictionary (column_name, data_type, is_nullable).
+    """
     with source_connection() as conn:
         return fetch_all(
             conn,
@@ -23,8 +51,13 @@ def get_source_columns(source_table: str) -> List[Dict[str, str]]:
         )
 
 
+# -----------------------------------------------------------------------------
+# DATA CONTRACT VERIFICATION
+# -----------------------------------------------------------------------------
 def verify_contract() -> bool:
-    """Verify that all 18 configured source tables exist in source OLTP database."""
+    """
+    Verifies that required operational tables exist in the source OLTP database.
+    """
     with source_connection() as conn:
         tables = fetch_all(
             conn,
@@ -39,8 +72,13 @@ def verify_contract() -> bool:
         return len(existing_tables) >= 18
 
 
+# -----------------------------------------------------------------------------
+# SCHEMA DRIFT DETECTOR
+# -----------------------------------------------------------------------------
 def detect_drift(source_table: str, expected_columns: List[str]) -> Dict[str, List[str]]:
-    """Compare actual source columns against expected column list; report missing or added columns."""
+    """
+    Compares live source table columns against an expected column schema definition.
+    """
     actual_cols = [c["column_name"] for c in get_source_columns(source_table)]
     actual_set = set(actual_cols)
     expected_set = set(expected_columns)

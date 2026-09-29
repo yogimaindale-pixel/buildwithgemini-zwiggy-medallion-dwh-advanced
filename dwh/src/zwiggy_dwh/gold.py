@@ -1,4 +1,23 @@
-"""Gold layer dimensional modeling (SCD2 dimensions, facts, and aggregate marts)."""
+"""
+===============================================================================
+ZWIGGY MEDALLION DATA WAREHOUSE - GOLD DIMENSIONAL MODELING ENGINE (gold.py)
+===============================================================================
+Goal & Purpose:
+---------------
+This module builds the business reporting Gold layer (`gold.*`) using Star Schema dimensional modeling.
+It creates Slowly Changing Dimensions Type 2 (SCD2) for customer and restaurant entities,
+fact tables for orders and payments with surrogate key resolution, and aggregate business marts.
+
+Why is this module critical for Junior Developers?
+1. Slowly Changing Dimensions Type 2 (SCD2): Preserves full historical changes over time
+   by managing `valid_from`, `valid_to`, `dw_is_current`, and `dw_version` tracking attributes.
+2. Surrogate Key Resolution (`-1` Fallback): Joins Silver records against Gold dimensions to assign integer
+   Surrogate Keys (e.g. `customer_sk`). If a match is missing, defaults to `-1` (Unknown Dimension Key)
+   to ensure zero lost revenue rows.
+3. Date & Time Key Functions (`gold.to_date_sk()`): Converts timestamps into YYYYMMDD integer SK keys
+   for fast index-based SQL analytical queries.
+===============================================================================
+"""
 
 import logging
 from typing import Dict
@@ -9,10 +28,18 @@ from zwiggy_dwh.db import execute_sql, fetch_scalar, warehouse_connection
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# SCD TYPE 2 CUSTOMER DIMENSION BUILDER
+# -----------------------------------------------------------------------------
 def build_dim_customer(batch: Batch) -> int:
-    """Build SCD2 dim_customer from slv_customer."""
+    """
+    Builds the `gold.dim_customer` SCD Type 2 dimension.
+    1. Expires existing active dimension records (`valid_to = NOW()`, `dw_is_current = FALSE`)
+       if customer details changed.
+    2. Inserts new version records with incremented `dw_version` and `dw_is_current = TRUE`.
+    """
     sql = """
-    -- 1. Expire modified current rows
+    -- 1. Expire updated dimension rows by setting dw_is_current to FALSE
     UPDATE gold.dim_customer d
     SET valid_to = s.updated_at,
         dw_is_current = FALSE
@@ -21,7 +48,7 @@ def build_dim_customer(batch: Batch) -> int:
       AND d.dw_is_current = TRUE
       AND (d.name IS DISTINCT FROM s.name OR d.email_masked IS DISTINCT FROM s.email_masked);
 
-    -- 2. Insert new version/current rows
+    -- 2. Insert new version rows into the dimension
     INSERT INTO gold.dim_customer (customer_id, name, email_masked, phone_masked, valid_from, dw_is_current, dw_version, dw_batch_id)
     SELECT
         s.customer_id,
@@ -46,8 +73,13 @@ def build_dim_customer(batch: Batch) -> int:
         return fetch_scalar(conn, "SELECT COUNT(*) FROM gold.dim_customer WHERE dw_batch_id = %s", (batch.batch_id,)) or 0
 
 
+# -----------------------------------------------------------------------------
+# SCD TYPE 2 RESTAURANT DIMENSION BUILDER
+# -----------------------------------------------------------------------------
 def build_dim_restaurant(batch: Batch) -> int:
-    """Build SCD2 dim_restaurant from slv_restaurant."""
+    """
+    Builds the `gold.dim_restaurant` SCD Type 2 dimension preserving historical attribute changes.
+    """
     sql = """
     UPDATE gold.dim_restaurant d
     SET valid_to = s.updated_at,
@@ -82,8 +114,15 @@ def build_dim_restaurant(batch: Batch) -> int:
         return fetch_scalar(conn, "SELECT COUNT(*) FROM gold.dim_restaurant WHERE dw_batch_id = %s", (batch.batch_id,)) or 0
 
 
+# -----------------------------------------------------------------------------
+# FACT ORDER BUILDER (WITH SURROGATE KEY RESOLUTION)
+# -----------------------------------------------------------------------------
 def build_fact_order(batch: Batch) -> int:
-    """Load fact_order with surrogate key resolution (-1 fallback for unknown)."""
+    """
+    Loads `gold.fact_order` table by linking `silver.slv_order` records with current
+    Surrogate Keys from `gold.dim_customer` and `gold.dim_restaurant`.
+    Assigns `-1` for missing dimension references.
+    """
     sql = """
     INSERT INTO gold.fact_order (
         order_id, customer_sk, restaurant_sk, order_date_sk, order_time_sk,
@@ -113,8 +152,13 @@ def build_fact_order(batch: Batch) -> int:
         return fetch_scalar(conn, "SELECT COUNT(*) FROM gold.fact_order WHERE dw_batch_id = %s", (batch.batch_id,)) or 0
 
 
+# -----------------------------------------------------------------------------
+# FACT PAYMENT BUILDER
+# -----------------------------------------------------------------------------
 def build_fact_payment(batch: Batch) -> int:
-    """Load fact_payment with surrogate key resolution."""
+    """
+    Loads `gold.fact_payment` by linking `silver.slv_payment` records with `gold.fact_order` surrogate keys.
+    """
     sql = """
     INSERT INTO gold.fact_payment (
         payment_id, order_sk, payment_method, status, amount, payment_date_sk, dw_batch_id
@@ -136,10 +180,15 @@ def build_fact_payment(batch: Batch) -> int:
         return fetch_scalar(conn, "SELECT COUNT(*) FROM gold.fact_payment WHERE dw_batch_id = %s", (batch.batch_id,)) or 0
 
 
+# -----------------------------------------------------------------------------
+# AGGREGATE BUSINESS MARTS REBUILDER
+# -----------------------------------------------------------------------------
 def rebuild_marts(batch: Batch) -> None:
-    """Rebuild aggregate mart tables for business reporting."""
+    """
+    Rebuilds summary reporting tables (such as `gold.mart_daily_business_summary`)
+    aggregating revenue, order counts, and active customer counts by day.
+    """
     sql = """
-    -- Rebuild mart_daily_business_summary
     INSERT INTO gold.mart_daily_business_summary (summary_date, total_orders, total_revenue, total_discounts, active_customers, dw_batch_id)
     SELECT
         d.full_date AS summary_date,
@@ -164,8 +213,13 @@ def rebuild_marts(batch: Batch) -> None:
         execute_sql(conn, sql, (batch.batch_id,))
 
 
+# -----------------------------------------------------------------------------
+# MASTER GOLD ORCHESTRATION RUNNER
+# -----------------------------------------------------------------------------
 def run_gold(batch: Batch) -> Dict[str, int]:
-    """Orchestrate Gold layer dimensions, facts, and marts."""
+    """
+    Orchestrates the complete Gold layer build across dimensions, facts, and aggregate business marts.
+    """
     results = {}
 
     with step(batch, "gold_dim_customer", "dim_customer") as res:
